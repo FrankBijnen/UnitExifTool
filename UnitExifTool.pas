@@ -2,19 +2,22 @@ unit UnitExifTool;
 
 interface
 
-uses Winapi.Windows, System.Classes, System.SysUtils, System.SyncObjs;
+uses Winapi.Windows, System.Classes, System.SysUtils;
 
 const
-  BLOCK_SIZE      = 4096;
-  BEGINMARK       = '{ready'; // '{ready' should be on pos 1 of the line!
-  ENDMARK         = '}' + #13#10;
-  ENDREQUEST      = '{endrequest}';
-  SENDENDREQUEST  = '-echo1' + #10 + ENDREQUEST + #10 + '-stay_open' + #10 + 'False' + #10;
-  MAXEXECNUM      = 99999;
-  QUIET           = '-quiet' + #10;
-  EXECUTE         = '-execute';
-  STARTEXIFTOOL   = 'exiftool -stay_open true -@ -';
-  DateTimeShift   = '%s=%u:%u:%u %u:%u:%u';
+  BLOCK_SIZE              = 4096;
+  BEGINMARK: Utf8string   = '{ready';       // '{ready' is usually on pos 1 of the line!
+  ENDMARK: Utf8String     = '}' + #13#10;
+  ENDREQUEST: Utf8String  = '{endrequest}';
+  SENDENDREQUEST          = '-echo1' + #10 + '{endrequest}' + #10 + '-stay_open' + #10 + 'False' + #10;
+  MAXEXECNUM              = 99999;
+  QUIET                   = '-quiet' + #10;
+  CHARSET                 = '-CHARSET';
+  CHARSETUTF8             = 'UTF8';
+  CHARSETFILEUTF8         = 'FILENAME=UTF8';
+  EXECUTE                 = '-execute';
+  STARTEXIFTOOL           = 'exiftool -stay_open true -@ -';
+  DateTimeShift           = '%s=%u:%u:%u %u:%u:%u';
 
 type
   TContent = record
@@ -27,12 +30,35 @@ type
 
   TGetExif = procedure(const AImage: string) of object;
   TOnReadyEvent = procedure(Sender: TObject; Content: TContent) of object;
+  TSignalExifToolProc = procedure(const ExecNum: integer; const Response: string) of object;
+
+  // Stream for handling reads from a Pipe written to by ExifTool.
+  // A Pipe is Ansi, but ExifTool writes UTF8.
+  TPipeStream = class(TBytesStream)
+  private
+    HFile: THandle;
+    FBufSize: integer;
+    FBeginMarker: integer; // Position Begin marker  {ready
+    FEndMarker: integer;   // Position End marker    }#13#10
+    FileBuffer: array of byte;
+
+    function GetPipe: Utf8String;
+    procedure SetPipe(const APipe: Utf8String; Offset: integer = 1);
+    function HasEndReq(const APipeString: UTF8String): boolean;
+    function FindMarkers(const APipeString: UTF8String; const ContinueFrom: Integer): boolean;
+    function ParseBuffer(ASignalExifToolProc: TSignalExifToolProc): boolean;
+
+  public
+    constructor Create(AFile: THandle; ABufSize: integer);
+    function PipeHasData: boolean;
+    function ReadPipe: DWORD;
+    function AsString: string;
+  end;
 
   TExifToolBase = class
   private
     FRunning: boolean;
     FExecNum: integer;
-    FLock: TMutex;
     FOnReady: TOnReadyEvent;
     procedure SetExecNum(AExecNum: integer);
   protected
@@ -47,16 +73,15 @@ type
 
   TReadThread = class(TThread)
   private
-    FLockList: TMutex;
     ContentList: TList;
     FExifTool: TExifToolBase;
     FPipeOut: THandle;
     FPipeErr: THandle;
-    FBuffer: String;
+    FOutputBuffer: TPipeStream;
+    FErrorBuffer: TPipeStream;
   protected
     procedure Execute; override;
-    function ReadErrors: String;
-    function CheckBuffer: boolean;
+    function ReadErrors: string;
     function GetPending: integer;
   public
     constructor Create(const PipeOut, PipeErr: THandle; const AExifTool: TExifToolBase);
@@ -90,6 +115,8 @@ type
     property ReadPipe: TReadThread read FReadPipe;
   end;
 
+var ExifTool: TExifTool;
+
 implementation
 
 {Light weight processmessages. Dont need to include Vcl.Forms}
@@ -104,6 +131,99 @@ begin
   end;
 end;
 
+{ TPipeStream }
+
+constructor TPipeStream.Create(AFile: THandle; ABufSize: integer);
+begin
+  inherited Create;
+  HFile := AFile;
+  FBufSize := ABufSize;
+  SetLength(FileBuffer, FBufSize);
+end;
+
+function TPipeStream.PipeHasData: boolean;
+var BytesAvail: DWORD;
+begin
+  result := PeekNamedPipe(HFile, nil, 0, nil, @BytesAvail, nil);
+  result := result and (BytesAvail > 0);
+end;
+
+function TPipeStream.ReadPipe: DWORD;
+begin
+  if (Winapi.Windows.ReadFile(HFile, FileBuffer[0], FBufSize, result, nil)) then
+    Write(FileBuffer[0], result);
+end;
+
+function TPipeStream.GetPipe: UTf8String;
+begin
+  SetLength(result, Size);
+  if (Size > 0) then
+    Move(Memory^, result[1], Size);
+end;
+
+procedure TPipeStream.SetPipe(const APipe: Utf8String; Offset: integer = 1);
+var L: integer;
+begin
+  Clear;
+  L := Length(APipe) + 1 - Offset;
+  if (L > 0) then
+    Write(APipe[Offset], L);
+end;
+
+function TPipeStream.HasEndReq(const APipeString: UTF8String): boolean;
+begin
+  result := (Copy(APipeString, 1, Length(ENDREQUEST)) = ENDREQUEST);
+end;
+
+function TPipeStream.FindMarkers(const APipeString: UTF8String; const ContinueFrom: Integer): boolean;
+begin
+  FBeginMarker := Pos(BEGINMARK, APipeString, ContinueFrom);
+  FEndMarker := Pos(ENDMARK, APipeString, FBeginMarker);
+  result := (FBeginMarker > 0) and (FEndMarker > 0);
+end;
+
+function TPipeStream.ParseBuffer(ASignalExifToolProc: TSignalExifToolProc): boolean;
+var
+  PipeString: Utf8String;   // Pipe as UTF8
+  ExecStr: string;
+  ExecNum: integer;
+  Response: string;
+  ContinueFrom: integer;    // Continue search from Position for Markers
+begin
+  PipeString := GetPipe;
+
+  // End requested?
+  result := HasEndReq(PipeString);
+  if result then
+    exit;
+
+  ContinueFrom := 1;
+  if not FindMarkers(PipeString, ContinueFrom) then
+    exit;
+
+  while (FBeginMarker > 0) and
+        (FEndMarker > 0) do
+  begin
+    // We have a complete message in our buffer.
+    // ie. something like {readynnnn}#13#10
+    Response := Utf8ToString(Copy(PipeString, 1, FBeginMarker - 1)); // Our Response
+    ExecStr := Utf8ToString(Copy(PipeString, FBeginMarker + Length(BEGINMARK), FEndMarker - FBeginMarker - Length(BEGINMARK)));
+    ExecNum := StrToIntDef(ExecStr, 0);           // Our Execnumber
+    ASignalExifToolProc(ExecNum, Response);       // Signal (T)Exiftool
+
+    ContinueFrom := FEndMarker + Length(ENDMARK); // Continue to search from last Endmark
+    FindMarkers(PipeString, ContinueFrom);        // Scan for more messages in our buffer
+  end;
+
+  // Store remainder back
+  SetPipe(PipeString, ContinueFrom);
+end;
+
+function TPipeStream.AsString: string;
+begin
+  result := UTF8ToString(GetPipe);
+end;
+
 { TExifToolBase }
 
 constructor TExifToolBase.Create;
@@ -111,12 +231,10 @@ begin
   inherited Create;
   FRunning := false;
   FExecNum := 0;
-  FLock := Tmutex.Create();
 end;
 
 destructor TExifToolBase.Destroy;
 begin
-  FLock.Free;
   inherited Destroy;
 end;
 
@@ -148,8 +266,9 @@ begin
   FPipeOut := PipeOut;
   FPipeErr := PipeErr;
   FExifTool := AExifTool;
-  FLockList := TMutex.Create();
   ContentList := TList.Create;
+  FOutputBuffer := TPipeStream.Create(FPipeOut, BLOCK_SIZE);
+  FErrorBuffer := TPipeStream.Create(FPipeErr, BLOCK_SIZE);
   ClearContent;
   inherited Create(false); // start running
 end;
@@ -158,21 +277,22 @@ destructor TReadThread.Destroy;
 begin
   ClearContent;
   ContentList.Free;
-  FLockList.Free;
+  FOutputBuffer.Free;
+  FErrorBuffer.Free;
   inherited Destroy;
 end;
 
 procedure TReadThread.PushContent(const ExecNum: integer; const Request: string);
 var Content: PContent;
 begin
-  FLockList.Acquire;
+  System.TMonitor.Enter(ContentList);
   try
-    new(Content);
+    New(Content);
     Content.ExecNum := ExecNum;
     Content.Request := Request;
     ContentList.Add(Content);
   finally
-    FLockList.Release;
+    System.TMonitor.Exit(ContentList);
   end;
 end;
 
@@ -180,7 +300,7 @@ function TReadThread.PopContent: TContent;
 var Content: PContent;
 begin
   FillChar(result, SizeOf(result), 0);
-  FLockList.Acquire;
+  System.TMonitor.Enter(ContentList);
   try
     if (ContentList.Count > 0) then
     begin
@@ -199,14 +319,14 @@ begin
       ContentList.Delete(0);
     end;
   finally
-    FLockList.Release;
+    System.TMonitor.Exit(ContentList);
   end;
 end;
 
 procedure TReadThread.UpdateContent(const ExecNum: integer; const Response, Error: string);
 var Content: PContent;
 begin
-  FLockList.Acquire;
+  System.TMonitor.Enter(ContentList);
   try
     for Content in ContentList do
     begin
@@ -218,7 +338,7 @@ begin
       end;
     end;
   finally
-    FLockList.Release;
+    System.TMonitor.Exit(ContentList);
   end;
 end;
 
@@ -228,89 +348,23 @@ begin
 end;
 
 procedure TReadThread.Execute;
-var BytesRead: DWORD;
-    FileBuffer: AnsiString; // Exiftool only uses ansi?
 begin
   repeat
-    // try to read from pipe
-    SetLength(FileBuffer, BLOCK_SIZE);
-    if ReadFile(FPipeOut, FileBuffer[1], BLOCK_SIZE, BytesRead, nil) then
-    begin
-      SetLength(FileBuffer, BytesRead);
-      FBuffer := FBuffer + string(FileBuffer);
-    end;
-  until (CheckBuffer);
+    // try to read from pipe. If nothing avail this thread will be blocked.
+    FOutputBuffer.ReadPipe;
+  until (FOutputBuffer.ParseBuffer(SignalExifTool));
   ClearContent;
 end;
 
-function TReadThread.CheckBuffer: boolean;
-var
-  ExecStr: string;
-  ExecNum: integer;
-  Response: string;
-  P: integer;
-  J: integer;
-
-  function FindEndReq: boolean;
-  begin
-    P := pos(ENDREQUEST, FBuffer);
-    result := P > 0;
-  end;
-
-  procedure FindMarkers;
-  begin
-    P := pos(BEGINMARK, FBuffer);
-    J := pos(ENDMARK, FBuffer, P);
-  end;
-
+function TReadThread.ReadErrors: string;
 begin
-  // End requested?
-  result := FindEndReq;
-  if result then
-    exit;
-
-  FindMarkers;
-
-  while (P > 0) and
-        (J > 0) do
-  begin
-    // We have a complete message in our buffer.
-    // ie. something like {readynnnn}#13#10
-    Response := copy(FBuffer, 1, P - 1); // Our Response
-    ExecStr := copy(FBuffer, P + length(BEGINMARK), J - P - length(BEGINMARK));
-    try
-      ExecNum := StrToInt(ExecStr); // Our Execnumber
-    except
-      ExecNum := 0;
-    end;
-    Delete(FBuffer, 1, J + length(ENDMARK) - 1); // Remove from buffer
-    SignalExifTool(ExecNum, Response); // Inform (T)Exiftool
-
-    FindMarkers; // Scan for more messages in our buffer.
-  end;
+  while (FErrorBuffer.PipeHasData) and
+        (FErrorBuffer.ReadPipe > 0) do;
+  result := FErrorBuffer.AsString;
+  FErrorBuffer.Clear;
 end;
 
-function TReadThread.ReadErrors: String;
-var BytesRead: DWORD;
-    BytesAvail: DWORD;
-    FileBuffer: AnsiString; // Exiftool only uses ansi?
-begin
-  result := '';
-  // Any errors?
-  PeekNamedPipe(FPipeErr, nil, 0, nil, @BytesAvail, nil);
-  while (BytesAvail > 0) do
-  begin
-    SetLength(FileBuffer, BLOCK_SIZE);
-    if (ReadFile(FPipeErr, FileBuffer[1], BLOCK_SIZE, BytesRead, nil)) then
-    begin
-      SetLength(FileBuffer, BytesRead);
-      result := result + string(FileBuffer);
-    end;
-    PeekNamedPipe(FPipeErr, nil, 0, nil, @BytesAvail, nil);
-  end;
-end;
-
-procedure TReadThread.SignalExifTool(const ExecNum: integer; const Response: String);
+procedure TReadThread.SignalExifTool(const ExecNum: integer; const Response: string);
 begin
   UpdateContent(ExecNum, Response, ReadErrors); // Update the list with our response
   Queue(OnReadyEvent);                          // Queue in the main thread.
@@ -328,14 +382,14 @@ end;
 
 procedure TReadThread.ClearContent;
 begin
-  FLockList.Acquire;
+  System.TMonitor.Enter(ContentList);
   try
     while (ContentList.Count > 0) do
       PopContent;
 
-    SetLength(FBuffer, 0);
+    FOutputBuffer.Clear;
   finally
-    FLockList.Release;
+    System.TMonitor.Exit(ContentList);
   end;
 end;
 
@@ -444,6 +498,10 @@ end;
 procedure TExifTool.AddExecute(var AStream: TstringStream);
 begin
   AStream.Position := AStream.Size;
+  AStream.WriteString(CHARSET + #10);
+  AStream.WriteString(CHARSETFILEUTF8 + #10);
+  AStream.WriteString(CHARSET + #10);
+  AStream.WriteString(CHARSETUTF8 + #10);
   AStream.WriteString(EXECUTE + IntToStr(ExecNum) + #10);
   FReadPipe.PushContent(ExecNum, AStream.DataString);
   AStream.Position := 0;
@@ -469,7 +527,7 @@ end;
 function TExifTool.Send(const ACmd: string): integer;
 var AStream: TstringStream;
 begin
-  AStream := TstringStream.Create(ACmd);
+  AStream := TStringStream.Create(ACmd, TEncoding.UTF8);
   try
     result := Send(AStream);
   finally
@@ -480,6 +538,16 @@ end;
 function TExifTool.Send(const ACmds: TStringList): integer;
 begin
   result := Send(ACmds.Text);
+end;
+
+initialization
+begin
+  ExifTool := TExifTool.Create;
+end;
+
+finalization
+begin
+  ExifTool.Free;
 end;
 
 end.

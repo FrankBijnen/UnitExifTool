@@ -157,8 +157,7 @@ object Form1: TForm1
       ShowGlyphs = True
       TabOrder = 0
       OnClick = FileListBox1Click
-      ExplicitLeft = 0
-      ExplicitTop = 153
+      ExplicitWidth = 517
     end
     object DriveComboBox1: TDriveComboBox
       Left = 1
